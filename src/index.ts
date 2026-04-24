@@ -1,116 +1,94 @@
 import { Connection, PublicKey, GetProgramAccountsFilter } from '@solana/web3.js';
 
 const RPC_URL = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
-const RAYDIUM_CPMM_PROGRAM = new PublicKey('CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C');
 const CHECK_INTERVAL_MS = parseInt(process.env.CHECK_INTERVAL_MS || '5000');
 const MIN_PROFIT_PCT = parseFloat(process.env.MIN_PROFIT_PCT || '0.5');
 const CPMM_FEE = 0.0025;
 
+const RAYDIUM_CPMM_PROGRAM = new PublicKey('CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C');
 const connection = new Connection(RPC_URL, 'confirmed');
 
-interface Pool {
+interface PoolData {
+  price: number;
   address: string;
-  mintA: string;
-  mintB: string;
   reserveA: bigint;
   reserveB: bigint;
-  price: number;
 }
 
-interface Opportunity {
-  pair: string;
-  poolBuy: Pool;
-  poolSell: Pool;
-  grossPct: number;
-  netPct: number;
-  timestamp: string;
-}
+type PairPools = Record<string, Record<string, PoolData>>;
 
-function parsePool(pubkey: string, data: Buffer): Pool | null {
+function parsePool(pubkey: string, data: Buffer): PoolData | null {
   try {
     if (data.length < 300) return null;
-    const mintA = new PublicKey(data.subarray(72, 104)).toBase58();
-    const mintB = new PublicKey(data.subarray(104, 136)).toBase58();
     const reserveA = data.readBigUInt64LE(253);
     const reserveB = data.readBigUInt64LE(261);
     if (reserveA === 0n || reserveB === 0n) return null;
-    const price = Number(reserveB) / Number(reserveA);
-    return { address: pubkey, mintA, mintB, reserveA, reserveB, price };
+    return { price: Number(reserveB) / Number(reserveA), address: pubkey, reserveA, reserveB };
   } catch { return null; }
 }
 
-async function fetchPools(): Promise<Pool[]> {
+function getMintPair(data: Buffer): [string, string] | null {
+  try {
+    return [
+      new PublicKey(data.subarray(72, 104)).toBase58(),
+      new PublicKey(data.subarray(104, 136)).toBase58(),
+    ];
+  } catch { return null; }
+}
+
+async function fetchAndGroupPools(): Promise<PairPools> {
   const filters: GetProgramAccountsFilter[] = [{ dataSize: 637 }];
-  const accounts = await connection.getProgramAccounts(RAYDIUM_CPMM_PROGRAM, {
-    filters, commitment: 'confirmed',
-  });
-  const pools: Pool[] = [];
+  const accounts = await connection.getProgramAccounts(RAYDIUM_CPMM_PROGRAM, { filters, commitment: 'confirmed' });
+  const poolPairs: PairPools = {};
+
   for (const { pubkey, account } of accounts) {
-    const pool = parsePool(pubkey.toBase58(), account.data as Buffer);
-    if (pool) pools.push(pool);
+    const data = account.data as Buffer;
+    const mints = getMintPair(data);
+    if (!mints) continue;
+    const pool = parsePool(pubkey.toBase58(), data);
+    if (!pool) continue;
+    const pair = mints.sort().join(':');
+    if (!poolPairs[pair]) poolPairs[pair] = {};
+    poolPairs[pair][pool.address] = pool;
   }
-  return pools;
+  return poolPairs;
 }
 
-function groupByPair(pools: Pool[]): Map<string, Pool[]> {
-  const map = new Map<string, Pool[]>();
-  for (const pool of pools) {
-    const key = [pool.mintA, pool.mintB].sort().join(':');
-    if (!map.has(key)) map.set(key, []);
-    map.get(key)!.push(pool);
-  }
-  return map;
-}
-
-function findOpportunities(pools: Pool[]): Opportunity[] {
-  const pairs = groupByPair(pools);
-  const opportunities: Opportunity[] = [];
-  for (const [pair, group] of pairs) {
-    if (group.length < 2) continue;
-    for (let i = 0; i < group.length; i++) {
-      for (let j = i + 1; j < group.length; j++) {
-        const a = group[i], b = group[j];
-        const high = a.price > b.price ? a : b;
-        const low  = a.price > b.price ? b : a;
-        const grossPct = ((high.price - low.price) / low.price) * 100;
-        const netPct   = grossPct - CPMM_FEE * 2 * 100;
-        if (netPct >= MIN_PROFIT_PCT) {
-          opportunities.push({ pair, poolBuy: low, poolSell: high,
-            grossPct, netPct, timestamp: new Date().toISOString() });
-        }
-      }
+function findArbitrage(poolPairs: PairPools): void {
+  let found = 0;
+  for (const [pair, pools] of Object.entries(poolPairs)) {
+    const sorted = Object.values(pools).sort((a, b) => a.price - b.price);
+    if (sorted.length < 2) continue;
+    const poolA = sorted[0];
+    const poolB = sorted[sorted.length - 1];
+    const grossPct = ((poolB.price - poolA.price) / poolA.price) * 100;
+    const netPct = grossPct - CPMM_FEE * 2 * 100;
+    if (netPct > MIN_PROFIT_PCT) {
+      found++;
+      console.log('\n' + '═'.repeat(55));
+      console.log('🎯 ARBITRAGE OPPORTUNITY');
+      console.log(`Pair:       ${pair.slice(0, 20)}...`);
+      console.log(`Pool A:     ${poolA.address.slice(0, 8)}... @ ${poolA.price.toExponential(4)}`);
+      console.log(`Pool B:     ${poolB.address.slice(0, 8)}... @ ${poolB.price.toExponential(4)}`);
+      console.log(`Net profit: ${netPct.toFixed(3)}%`);
+      console.log(`Direction:  ${poolA.address.slice(0, 8)} -> ${poolB.address.slice(0, 8)}`);
+      console.log(`Time:       ${new Date().toISOString()}`);
     }
   }
-  return opportunities.sort((a, b) => b.netPct - a.netPct);
+  if (found === 0) process.stdout.write(`\r[${new Date().toISOString()}] No opportunities above ${MIN_PROFIT_PCT}%   `);
 }
 
 async function main(): Promise<void> {
-  console.log('🚀 Raydium CPMM Arbitrage Monitor v1.0.0');
+  console.log('🚀 Raydium CPMM Arbitrage Monitor v1.1.0');
   console.log(`📡 RPC: ${RPC_URL} | ⏱ ${CHECK_INTERVAL_MS}ms | 💰 Min: ${MIN_PROFIT_PCT}%`);
-  let cycle = 0;
-  while (true) {
-    cycle++;
+  const run = async () => {
     try {
-      process.stdout.write(`\r[${cycle}] Fetching...`);
-      const pools = await fetchPools();
-      const opps = findOpportunities(pools);
-      if (opps.length === 0) {
-        process.stdout.write(`\r[${cycle}] ${pools.length} pools — no opportunities   `);
-      } else {
-        for (const opp of opps) {
-          console.log('\n' + '═'.repeat(50));
-          console.log('🎯 ARBITRAGE OPPORTUNITY');
-          console.log(`Buy:  ${opp.poolBuy.address.slice(0,8)}... @ ${opp.poolBuy.price.toExponential(4)}`);
-          console.log(`Sell: ${opp.poolSell.address.slice(0,8)}... @ ${opp.poolSell.price.toExponential(4)}`);
-          console.log(`Net profit: ${opp.netPct.toFixed(3)}%`);
-          console.log(`Time: ${opp.timestamp}`);
-        }
-      }
-    } catch (err) {
-      console.error(`\n[${cycle}] Error:`, (err as Error).message);
-    }
-    await new Promise(r => setTimeout(r, CHECK_INTERVAL_MS));
-  }
+      const poolPairs = await fetchAndGroupPools();
+      findArbitrage(poolPairs);
+    } catch (err) { console.error(`\nError: ${(err as Error).message}`); }
+  };
+  await run();
+  setInterval(run, CHECK_INTERVAL_MS);
 }
 
 main().catch(e => { console.error(e); process.exit(1); });
